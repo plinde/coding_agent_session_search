@@ -2633,9 +2633,27 @@
       "arguments": [
         {
           "name": "workspace",
-          "description": "Filter to sessions for this workspace/project directory",
+          "description": "Filter to sessions for this workspace/project directory (also matches its ancestors and descendants, nearest first; see --exact)",
           "arg_type": "option",
           "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "exact",
+          "description": "Match only sessions recorded for exactly the --workspace (or --current) directory, not its ancestors or descendants",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or an exact source_id (e.g. 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
           "required": false
         },
         {

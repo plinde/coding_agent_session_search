@@ -55,7 +55,7 @@ commands:
     Aliases: ready, preflight.
   cass status [--json] [--stale-threshold N] [--data-dir DIR]
   cass diag [--json] [--verbose] [--data-dir DIR]
-  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
+  cass sessions [--workspace DIR] [--current] [--exact] [--source SRC] [--limit N] [--since WHEN] [--json]
   cass view <path> [-n LINE] [-C CONTEXT] [--json]
   cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]
                     In --json mode, NDJSON events stream on stderr:

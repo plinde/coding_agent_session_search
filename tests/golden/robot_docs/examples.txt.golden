@@ -47,6 +47,7 @@ examples:
 # Discover session files for follow-up actions
   cass sessions --current --json             # best match for current cwd
   cass sessions --workspace /myproject --json --limit 5
+  cass sessions --workspace /myproject --exact --source work-laptop --json
 
 # Follow up on search results
   cass view /path/to/session.jsonl -n 42   # view line 42 with context
