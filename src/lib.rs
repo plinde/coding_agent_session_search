@@ -91088,6 +91088,95 @@ mod cli_read_db_tests {
         assert_eq!(target.argv[1], "resume");
     }
 
+    fn remote_mirror_session_path(configured: &str, rest: &str) -> PathBuf {
+        PathBuf::from("/Users/ellis/.local/share/coding-agent-search/remotes/devbox/mirror")
+            .join(crate::sources::sync::path_to_safe_dirname(configured))
+            .join(rest)
+    }
+
+    #[test]
+    fn resume_detects_claude_code_from_remote_mirror_path() {
+        for configured in ["~/.claude/projects", "/home/ellis/.claude/projects"] {
+            let path = remote_mirror_session_path(
+                configured,
+                "projects/-home-ellis-proj/abc12345-dead-beef-cafe-0123456789ab.jsonl",
+            );
+            let target = resolve_resume_target(&path, None)
+                .unwrap_or_else(|error| panic!("{}: {}", path.display(), error.message));
+            assert_eq!(target.agent, "claude", "{}", path.display());
+            assert_eq!(
+                target.argv,
+                vec!["claude", "--resume", "abc12345-dead-beef-cafe-0123456789ab"]
+            );
+            assert!(
+                target.detection_reason.contains("remote mirror container"),
+                "{}",
+                target.detection_reason
+            );
+        }
+    }
+
+    #[test]
+    fn resume_detects_codex_from_remote_mirror_path() {
+        let path = remote_mirror_session_path(
+            "~/.codex/sessions",
+            "sessions/2026/10/25/rollout-2026-10-25T10-00-00-fedc1234-babe-cafe-beef-abcdef012345.jsonl",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(
+            target.argv,
+            vec!["codex", "resume", "fedc1234-babe-cafe-beef-abcdef012345"]
+        );
+    }
+
+    #[test]
+    fn resume_detects_other_harnesses_from_remote_mirror_containers() {
+        for (configured, rest, expected) in [
+            (
+                "~/.pi/agent/sessions",
+                "sessions/--proj--/s.jsonl",
+                "pi_agent",
+            ),
+            ("~/.gemini/tmp", "tmp/abc/chats/session.json", "gemini"),
+            (
+                "~/.gemini/antigravity-cli/brain",
+                "brain/0b6e4c2a-1111-2222-3333-444455556666/log.jsonl",
+                "antigravity",
+            ),
+        ] {
+            let path = remote_mirror_session_path(configured, rest);
+            let detected = detect_resume_agent(&path, None)
+                .unwrap_or_else(|error| panic!("{}: {}", path.display(), error.message));
+            assert_eq!(detected.slug, expected, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn resume_mirror_container_names_are_trusted_only_in_the_mirror_slot() {
+        let safe = crate::sources::sync::path_to_safe_dirname("~/.claude/projects");
+        let session = "projects/-proj/abc12345-dead-beef-cafe-0123456789ab.jsonl";
+        for path in [
+            // Same container name outside `remotes/<source>/mirror/`.
+            PathBuf::from("/Users/ellis/backups")
+                .join(&safe)
+                .join(session),
+            // Marker-shaped container without the hash suffix.
+            PathBuf::from("/data/remotes/devbox/mirror/.claude_projects").join(session),
+            // Marker that is only a prefix of a flattened component.
+            PathBuf::from("/data/remotes/devbox/mirror/.claude_projectsx_0123abcd").join(session),
+            // A configured path that names no known store.
+            remote_mirror_session_path(
+                "~/notes",
+                "notes/abc12345-dead-beef-cafe-0123456789ab.jsonl",
+            ),
+        ] {
+            let err = detect_resume_agent(&path, None)
+                .expect_err(&format!("{} must not be attributed", path.display()));
+            assert_eq!(err.kind, "unknown-agent", "{}", path.display());
+        }
+    }
+
     #[test]
     fn resume_agent_detection_accepts_native_windows_separators() {
         for (path, expected) in [
@@ -112129,6 +112218,13 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path contains gemini storage".to_string(),
         });
     }
+    if let Some((slug, container)) = detect_resume_agent_from_mirror_container(&path_str) {
+        return Ok(DetectedAgent {
+            slug,
+            is_override: false,
+            reason: format!("remote mirror container '{container}' names a {slug} store"),
+        });
+    }
 
     Err(CliError {
         code: 3,
@@ -112142,6 +112238,50 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
                 .into(),
         ),
         retryable: false,
+    })
+}
+
+/// Recover the harness of a session synced from a remote source.
+///
+/// `cass sources sync` mirrors each configured remote path into
+/// `remotes/<source>/mirror/<safe-name>/<basename>/...`, where `<safe-name>`
+/// is the configured path with its separators flattened to `_` plus a hash
+/// (`path_to_safe_dirname`). Flattening hides the `.claude/projects` and
+/// `.codex/sessions` segments the layout checks in [`detect_resume_agent`]
+/// look for, so `cass resume <mirror path>` reported `unknown-agent` for the
+/// paths `cass search` printed. The container name still carries the
+/// configured path; read it only in that exact slot, so an ordinary local
+/// directory with a marker-shaped name is never treated as provenance.
+///
+/// `path_str` must already be `/`-separated and ASCII-lowercased.
+fn detect_resume_agent_from_mirror_container(path_str: &str) -> Option<(&'static str, &str)> {
+    // Antigravity stores live under `.gemini`, so they are checked first.
+    const MARKERS: &[(&str, &str)] = &[
+        (".claude_projects", "claude"),
+        (".codex_sessions", "codex"),
+        (".codex_archived_sessions", "codex"),
+        (".pi_agent", "pi_agent"),
+        (".gemini_antigravity", "antigravity"),
+        (".gemini_antigravity-cli", "antigravity"),
+        (".gemini", "gemini"),
+    ];
+    let parts: Vec<&str> = path_str
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts.windows(4).find_map(|window| {
+        if window[0] != "remotes" || window[2] != "mirror" {
+            return None;
+        }
+        let container = window[3];
+        let (encoded, hash) = container.rsplit_once('_')?;
+        if !crate::sources::sync::is_safe_mirror_hash(hash) {
+            return None;
+        }
+        MARKERS
+            .iter()
+            .find(|(marker, _)| crate::sources::sync::encoded_path_has_marker(encoded, marker))
+            .map(|(_, slug)| (*slug, container))
     })
 }
 
