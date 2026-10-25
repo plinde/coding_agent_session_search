@@ -881,6 +881,8 @@ Index: agent_search.db + index/v9-quill/
 
 Where `<path>` is a filesystem-safe version of the remote path (e.g. `.claude_projects`), and `<hash>` is an FNV-1a hash of the original path in hex, so `foo/bar` and `foo_bar` never collide.
 
+**SQLite sources** (OpenCode's `opencode.db`, Goose's `sessions.db`, ...): a database in WAL mode keeps recent writes in `<db>-wal` until the next checkpoint. List the sidecar next to the database, for example `paths = ["~/.local/share/opencode/opencode.db", "~/.local/share/opencode/opencode.db-wal"]`. A path ending in `-wal`, `-shm` or `-journal` syncs into its database's `<path>_<hash>/` directory rather than its own, so the mirrored database is read with its WAL applied. Each path is still a separate transfer, so a sync that overlaps a checkpoint on the remote can copy a database and WAL from different moments. For a database that is written constantly, sync a consistent snapshot instead: have the remote write one with `sqlite3 "file:$HOME/.local/share/opencode/opencode.db?mode=ro" ".backup $HOME/.cache/cass-export/opencode/opencode.db"` before each sync, and list that snapshot path. Do not sync the whole `~/.local/share/opencode` directory: it also holds credentials (`auth.json`).
+
 Sessions from remotes are indexed alongside local sessions, with provenance tracking to identify origin.
 
 #### Path Mappings

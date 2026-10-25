@@ -1174,7 +1174,7 @@ impl SyncEngine {
     ) -> PathSyncResult {
         let start = Instant::now();
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = dest_dir.join(mirror_container_dirname(remote_path));
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1201,7 +1201,7 @@ impl SyncEngine {
 
         // Convert remote path to safe local directory name
         // Use raw remote_path for stability (independent of home expansion success)
-        let safe_name = path_to_safe_dirname(remote_path);
+        let safe_name = mirror_container_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
         // Create local directory without following any pre-existing mirror symlink.
@@ -1390,7 +1390,7 @@ impl SyncEngine {
         let start = Instant::now();
 
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = dest_dir.join(mirror_container_dirname(remote_path));
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1405,7 +1405,7 @@ impl SyncEngine {
         }
 
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
-        let safe_name = path_to_safe_dirname(remote_path);
+        let safe_name = mirror_container_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
@@ -1562,7 +1562,7 @@ impl SyncEngine {
         let start = Instant::now();
 
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = dest_dir.join(mirror_container_dirname(remote_path));
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1577,7 +1577,7 @@ impl SyncEngine {
         }
 
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
-        let safe_name = path_to_safe_dirname(remote_path);
+        let safe_name = mirror_container_dirname(remote_path);
         let local_path = dest_dir.join(&safe_name);
 
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
@@ -1898,7 +1898,7 @@ impl SyncEngine {
     ) -> PathSyncResult {
         let start = Instant::now();
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = dest_dir.join(mirror_container_dirname(remote_path));
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1913,7 +1913,7 @@ impl SyncEngine {
         }
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
         // Use raw remote_path for stability (independent of home expansion success)
-        let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+        let local_path = dest_dir.join(mirror_container_dirname(remote_path));
 
         // Create local directory without following any pre-existing mirror symlink.
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
@@ -2589,6 +2589,32 @@ pub(crate) fn encoded_path_has_marker(encoded: &str, marker: &str) -> bool {
         (index == 0 || encoded.as_bytes()[index - 1] == b'_')
             && (end == encoded.len() || encoded.as_bytes()[end] == b'_')
     })
+}
+
+/// SQLite keeps uncommitted and not-yet-checkpointed pages next to the
+/// database in `<db>-wal` (and `<db>-journal` / `<db>-shm`). These suffixes
+/// are SQLite's fixed naming, independent of the database's own extension.
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// If `path` names a SQLite sidecar file (`opencode.db-wal`), return the
+/// database path it belongs to (`opencode.db`).
+pub fn sqlite_sidecar_database_path(path: &str) -> Option<&str> {
+    SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        let database = path.strip_suffix(suffix)?;
+        let file_name = database.rsplit(['/', '\\']).next().unwrap_or(database);
+        (!file_name.is_empty() && file_name != "~").then_some(database)
+    })
+}
+
+/// The mirror container a configured remote path syncs into.
+///
+/// Each configured path gets its own `path_to_safe_dirname` container, except
+/// SQLite sidecars: `~/.local/share/opencode/opencode.db-wal` lands in the
+/// container of `~/.local/share/opencode/opencode.db`, next to the database
+/// file. A WAL in a separate directory is never applied, so the mirror would
+/// otherwise read as the state at the last checkpoint.
+pub fn mirror_container_dirname(remote_path: &str) -> String {
+    path_to_safe_dirname(sqlite_sidecar_database_path(remote_path).unwrap_or(remote_path))
 }
 
 fn fnv1a_hash(text: &str) -> u64 {
@@ -3295,6 +3321,42 @@ mod tests {
 
         let res = path_to_safe_dirname("");
         assert!(res.starts_with("root_"));
+    }
+
+    #[test]
+    fn sqlite_sidecars_share_their_database_mirror_container() {
+        let db = "~/.local/share/opencode/opencode.db";
+        for sidecar in [
+            "~/.local/share/opencode/opencode.db-wal",
+            "~/.local/share/opencode/opencode.db-shm",
+            "~/.local/share/opencode/opencode.db-journal",
+        ] {
+            assert_eq!(sqlite_sidecar_database_path(sidecar), Some(db));
+            assert_eq!(
+                mirror_container_dirname(sidecar),
+                path_to_safe_dirname(db),
+                "{sidecar} must land next to its database"
+            );
+        }
+        assert_eq!(
+            sqlite_sidecar_database_path(r"C:\Users\me\AppData\opencode.db-wal"),
+            Some(r"C:\Users\me\AppData\opencode.db")
+        );
+
+        // Everything else keeps its own container.
+        for path in [
+            db,
+            "~/.claude/projects",
+            "~/.codex/sessions",
+            "/srv/state.vscdb",
+        ] {
+            assert_eq!(sqlite_sidecar_database_path(path), None, "{path}");
+            assert_eq!(mirror_container_dirname(path), path_to_safe_dirname(path));
+        }
+        // A bare suffix has no database name to attach to.
+        for path in ["-wal", "~/-wal", "/srv/-shm", "~"] {
+            assert_eq!(sqlite_sidecar_database_path(path), None, "{path}");
+        }
     }
 
     #[test]

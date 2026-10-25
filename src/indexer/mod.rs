@@ -82,7 +82,7 @@ use crate::search::vector_index::{
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
-use crate::sources::sync::path_to_safe_dirname;
+use crate::sources::sync::{path_to_safe_dirname, sqlite_sidecar_database_path};
 use crate::storage::sqlite::incompatible_legacy_fts_shadow_ddl;
 #[cfg(test)]
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
@@ -33779,6 +33779,11 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
 
             for path in &source.paths {
                 if source.is_remote() {
+                    // A SQLite sidecar (`opencode.db-wal`) syncs into its
+                    // database's container, which the database path scans.
+                    if sqlite_sidecar_database_path(path).is_some() {
+                        continue;
+                    }
                     // Sync keys mirror directories by the exact configured
                     // path, independent of remote home expansion.
                     let safe_name = path_to_safe_dirname(path);
@@ -33881,6 +33886,9 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                         continue;
                     };
                     if source.kind.is_remote() {
+                        if sqlite_sidecar_database_path(path).is_some() {
+                            continue;
+                        }
                         let safe_name = path_to_safe_dirname(path);
                         let mirror_path = data_dir
                             .join("remotes")
@@ -69130,6 +69138,51 @@ c.close()
             assert_eq!(remote.origin.source_id, "laptop");
             assert_eq!(remote.mirrored_source_path.as_deref(), Some(path));
         }
+    }
+
+    #[test]
+    #[serial]
+    fn build_scan_roots_scans_a_sqlite_database_container_once_with_its_sidecars() {
+        let _guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+
+        let db = "~/.local/share/opencode/opencode.db";
+        let wal = "~/.local/share/opencode/opencode.db-wal";
+        storage
+            .upsert_source(&crate::sources::provenance::Source {
+                id: "laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("operator@laptop.invalid".to_string()),
+                machine_id: None,
+                platform: Some("linux".to_string()),
+                config_json: Some(serde_json::json!({"paths": [db, wal]})),
+                created_at: None,
+                updated_at: None,
+            })
+            .unwrap();
+        // `sources sync` puts both files in the database's container.
+        let container = data_dir
+            .join("remotes/laptop/mirror")
+            .join(crate::sources::sync::mirror_container_dirname(wal));
+        assert_eq!(
+            container.file_name().unwrap(),
+            path_to_safe_dirname(db).as_str()
+        );
+        std::fs::create_dir_all(&container).unwrap();
+        std::fs::write(container.join("opencode.db"), b"").unwrap();
+        std::fs::write(container.join("opencode.db-wal"), b"").unwrap();
+
+        let roots = build_scan_roots(Some(&storage), &data_dir);
+        let remote: Vec<_> = roots
+            .iter()
+            .filter(|root| root.origin.is_remote())
+            .collect();
+        assert_eq!(remote.len(), 1, "the WAL must not add a second scan root");
+        assert_eq!(remote[0].path, container);
+        assert_eq!(remote[0].mirrored_source_path.as_deref(), Some(db));
     }
 
     #[test]
