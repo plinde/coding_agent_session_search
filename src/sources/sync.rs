@@ -2573,6 +2573,24 @@ pub fn path_to_safe_dirname(path: &str) -> String {
     }
 }
 
+/// True when `value` is the hex hash suffix [`path_to_safe_dirname`] appends.
+pub(crate) fn is_safe_mirror_hash(value: &str) -> bool {
+    (8..=16).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// True when `marker` appears in the `_`-joined part of a safe mirror name as
+/// whole flattened path components (bounded by `_` or the ends).
+pub(crate) fn encoded_path_has_marker(encoded: &str, marker: &str) -> bool {
+    encoded.match_indices(marker).any(|(index, _)| {
+        let end = index + marker.len();
+        (index == 0 || encoded.as_bytes()[index - 1] == b'_')
+            && (end == encoded.len() || encoded.as_bytes()[end] == b'_')
+    })
+}
+
 fn fnv1a_hash(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in text.bytes() {

@@ -14,6 +14,7 @@ use anyhow::Result;
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
 };
+use crate::sources::sync::{encoded_path_has_marker, is_safe_mirror_hash};
 
 pub struct OmpConnector {
     inner: franken_agent_detection::OmpConnector,
@@ -330,21 +331,6 @@ fn has_pi_agent_layout_marker(path: &Path) -> bool {
         parts
             .windows(2)
             .any(|parts| parts[0] == ".pi" && parts[1] == "agent")
-    })
-}
-
-fn is_safe_mirror_hash(value: &str) -> bool {
-    (8..=16).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn encoded_path_has_marker(encoded: &str, marker: &str) -> bool {
-    encoded.match_indices(marker).any(|(index, _)| {
-        let end = index + marker.len();
-        (index == 0 || encoded.as_bytes()[index - 1] == b'_')
-            && (end == encoded.len() || encoded.as_bytes()[end] == b'_')
     })
 }
 
