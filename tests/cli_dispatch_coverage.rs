@@ -3271,6 +3271,163 @@ fn sessions_json_reports_recent_and_current_workspace_sessions() {
     );
 }
 
+/// Remote rows have no statable source file (their path is the local mirror
+/// copy), so they must still carry a `modified` value and sort by recorded
+/// activity. `--source` narrows by origin and `--exact` drops the ancestor
+/// and descendant workspaces `--workspace` otherwise includes.
+#[test]
+fn sessions_json_remote_rows_sort_by_activity_and_filter_by_source_and_exact_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let project = tmp.path().join("project");
+    let app = project.join("app");
+    fs::create_dir_all(&app).unwrap();
+
+    let local_app = tmp.path().join("local-app.jsonl");
+    let local_project = tmp.path().join("local-project.jsonl");
+    fs::write(&local_app, "{}\n").unwrap();
+    fs::write(&local_project, "{}\n").unwrap();
+    let remote_app =
+        data_dir.join("remotes/devbox/mirror/.claude_projects_0123abcd/projects/remote-app.jsonl");
+
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude_code", "Claude Code"))
+        .unwrap();
+    let app_id = storage.ensure_workspace(&app, Some("app")).unwrap();
+    let project_id = storage.ensure_workspace(&project, Some("project")).unwrap();
+
+    let message_pair = |ts: i64| {
+        vec![
+            sample_message(0, MessageRole::User, ts, "question"),
+            sample_message(1, MessageRole::Agent, ts + 1, "answer"),
+        ]
+    };
+    for (workspace_id, workspace, path, id, started) in [
+        (app_id, &app, &local_app, "local-app", 1_700_000_000_000_i64),
+        (
+            project_id,
+            &project,
+            &local_project,
+            "local-project",
+            1_700_000_050_000,
+        ),
+    ] {
+        storage
+            .insert_conversation_tree(
+                claude_id,
+                Some(workspace_id),
+                &sample_conversation(
+                    "claude_code",
+                    workspace,
+                    path,
+                    id,
+                    id,
+                    started,
+                    message_pair(started),
+                ),
+            )
+            .unwrap();
+    }
+    // Recorded activity later than any local file mtime, so it must sort first.
+    let remote_started = 4_000_000_000_000_i64;
+    let mut remote = sample_conversation(
+        "claude_code",
+        &app,
+        &remote_app,
+        "remote-app",
+        "remote-app",
+        remote_started,
+        message_pair(remote_started),
+    );
+    remote.source_id = "devbox".to_string();
+    remote.origin_host = Some("me@devbox".to_string());
+    storage
+        .insert_conversation_tree(claude_id, Some(app_id), &remote)
+        .unwrap();
+
+    let sessions = |extra: &[&str]| -> Vec<Value> {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args([
+            "sessions",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+        json["sessions"].as_array().expect("sessions array").clone()
+    };
+    let paths = |rows: &[Value]| -> Vec<String> {
+        rows.iter()
+            .map(|row| row["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let p = |path: &Path| path.to_string_lossy().into_owned();
+
+    let all = sessions(&[]);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0]["path"].as_str().unwrap(), p(&remote_app));
+    assert_eq!(all[0]["source_id"].as_str(), Some("devbox"));
+    let remote_modified = all[0]["modified"]
+        .as_str()
+        .expect("remote row must carry a modified timestamp");
+    assert!(remote_modified.starts_with("2096-"), "{remote_modified}");
+
+    assert_eq!(
+        paths(&sessions(&["--source", "devbox"])),
+        vec![p(&remote_app)]
+    );
+    assert_eq!(
+        paths(&sessions(&["--source", "remote"])),
+        vec![p(&remote_app)]
+    );
+    let mut local = paths(&sessions(&["--source", "local"]));
+    local.sort();
+    let mut expected_local = vec![p(&local_app), p(&local_project)];
+    expected_local.sort();
+    assert_eq!(local, expected_local);
+    assert_eq!(sessions(&["--source", "all"]).len(), 3);
+    assert!(sessions(&["--source", "no-such-host"]).is_empty());
+
+    let app_arg = app.to_str().unwrap();
+    assert_eq!(
+        sessions(&["--workspace", app_arg]).len(),
+        3,
+        "without --exact the ancestor workspace still matches"
+    );
+    let mut exact = paths(&sessions(&["--workspace", app_arg, "--exact"]));
+    exact.sort();
+    let mut expected_exact = vec![p(&local_app), p(&remote_app)];
+    expected_exact.sort();
+    assert_eq!(exact, expected_exact);
+    assert_eq!(
+        paths(&sessions(&[
+            "--workspace",
+            app_arg,
+            "--exact",
+            "--source",
+            "local"
+        ])),
+        vec![p(&local_app)]
+    );
+
+    let mut bare_exact = base_cmd(tmp.path());
+    bare_exact.args([
+        "sessions",
+        "--exact",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    bare_exact.assert().code(2);
+}
+
 /// cass#323: `--limit` must truncate the result (counts are backfilled only
 /// for surviving sessions) and `--since` must bound the enumeration window
 /// by recorded activity timestamps.

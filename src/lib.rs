@@ -1299,9 +1299,18 @@ pub enum Commands {
     },
     /// List recent sessions, with optional workspace/current-session filtering
     Sessions {
-        /// Filter to sessions for this workspace/project directory
+        /// Filter to sessions for this workspace/project directory (also
+        /// matches its ancestors and descendants, nearest first; see --exact)
         #[arg(long, value_hint = ValueHint::DirPath)]
         workspace: Option<PathBuf>,
+        /// Match only sessions recorded for exactly the --workspace (or
+        /// --current) directory, not its ancestors or descendants
+        #[arg(long, default_value_t = false)]
+        exact: bool,
+        /// Filter by source: 'local', 'remote', 'all', or an exact source_id
+        /// (e.g. 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Resolve the current workspace automatically and return the most recent match
         #[arg(long, default_value_t = false)]
         current: bool,
@@ -9235,6 +9244,8 @@ async fn execute_cli(
                 }
                 Commands::Sessions {
                     workspace,
+                    exact,
+                    source,
                     current,
                     limit,
                     since,
@@ -9244,6 +9255,8 @@ async fn execute_cli(
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_sessions(
                         workspace.as_ref(),
+                        exact,
+                        source.as_deref(),
                         current,
                         limit,
                         since.as_deref(),
@@ -27126,7 +27139,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
-            "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
+            "  cass sessions [--workspace DIR] [--current] [--exact] [--source SRC] [--limit N] [--since WHEN] [--json]"
                 .to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]"
@@ -27458,6 +27471,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "# Discover session files for follow-up actions".to_string(),
             "  cass sessions --current --json             # best match for current cwd".to_string(),
             "  cass sessions --workspace /myproject --json --limit 5".to_string(),
+            "  cass sessions --workspace /myproject --exact --source work-laptop --json".to_string(),
             String::new(),
             "# Follow up on search results".to_string(),
             "  cass view /path/to/session.jsonl -n 42   # view line 42 with context".to_string(),
@@ -96183,11 +96197,26 @@ struct SessionSummaryRecord {
     source_path: PathBuf,
     source_id: String,
     origin_host: Option<String>,
+    is_local: bool,
     started_at: Option<i64>,
     modified_at: Option<i64>,
     size_bytes: Option<u64>,
     message_count: i64,
     human_turns: i64,
+}
+
+impl SessionSummaryRecord {
+    fn matches_source(&self, filter: &crate::sources::provenance::SourceFilter) -> bool {
+        use crate::sources::provenance::SourceFilter;
+        match filter {
+            SourceFilter::All => true,
+            SourceFilter::Local => self.is_local,
+            SourceFilter::Remote => !self.is_local,
+            SourceFilter::SourceId(id) => {
+                canonical_followup_source_id(Some(id)).as_deref() == Some(self.source_id.as_str())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -96279,8 +96308,11 @@ mod path_spelling_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sessions(
     workspace: Option<&PathBuf>,
+    exact: bool,
+    source: Option<&str>,
     current: bool,
     limit: Option<usize>,
     since: Option<&str>,
@@ -96289,6 +96321,7 @@ fn run_sessions(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::sources::provenance::SourceFilter;
 
     // Parse flags before opening anything, so a bad value is a usage error
     // even where no archive exists.
@@ -96296,6 +96329,17 @@ fn run_sessions(
         None => None,
         Some(raw) => Some(parse_search_time_bound("--since", raw, TimeBound::Since)?),
     };
+    if exact && workspace.is_none() && !current {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "`--exact` needs a workspace to match: pass --workspace <dir> or --current"
+                .into(),
+            hint: Some("Example: cass sessions --workspace ~/src/app --exact --json".into()),
+            retryable: false,
+        });
+    }
+    let source_filter = source.map(SourceFilter::parse).unwrap_or_default();
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
         (Some(path), _) => Some(normalize_session_filter_path(path)?),
@@ -96413,16 +96457,23 @@ fn run_sessions(
                 );
                 let normalized_origin_kind =
                     normalized_provenance_origin_kind(source_id.as_str(), origin_kind.as_deref());
-                let metadata =
-                    if normalized_origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID {
-                        std::fs::metadata(&source_path_buf).ok()
-                    } else {
-                        None
-                    };
+                let is_local =
+                    normalized_origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID;
+                let metadata = if is_local {
+                    std::fs::metadata(&source_path_buf).ok()
+                } else {
+                    None
+                };
+                // A remote row's source_path is the local mirror copy, whose
+                // mtime is the last sync, not the last activity; fall back to
+                // the recorded activity window so remote rows still sort by
+                // recency instead of sinking below every local row.
                 let modified_at = metadata
                     .as_ref()
                     .and_then(|m| m.modified().ok())
-                    .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
+                    .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis())
+                    .or(ended_at)
+                    .or(started_at);
 
                 let has_recorded_timestamp = started_at.is_some() || ended_at.is_some();
                 (
@@ -96436,6 +96487,7 @@ fn run_sessions(
                         source_path: source_path_buf,
                         source_id,
                         origin_host,
+                        is_local,
                         started_at,
                         modified_at,
                         size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
@@ -96464,12 +96516,19 @@ fn run_sessions(
         });
     }
 
+    if !source_filter.is_all() {
+        sessions.retain(|(_, _, session)| session.matches_source(&source_filter));
+    }
+
     if let Some(target) = target_workspace.as_deref() {
         for (_, _, session) in &mut sessions {
             session.workspace_match_distance =
                 workspace_match_distance(session.workspace.as_deref(), target);
         }
-        sessions.retain(|(_, _, session)| session.workspace_match_distance.is_some());
+        sessions.retain(|(_, _, session)| match session.workspace_match_distance {
+            Some(distance) => !exact || distance == 0,
+            None => false,
+        });
     }
 
     sessions.sort_by(|(_, _, left), (_, _, right)| {
