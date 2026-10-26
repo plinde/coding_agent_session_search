@@ -20,7 +20,6 @@ fn cass(home: &Path, streaming: &str) -> assert_cmd::Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", home.join("data"))
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_STREAMING_INDEX", streaming)
         .env("CASS_AUTO_REFRESH", "0")
         .env("RUST_MIN_STACK", "134217728")
@@ -28,6 +27,10 @@ fn cass(home: &Path, streaming: &str) -> assert_cmd::Command {
         .current_dir(home)
         .timeout(Duration::from_secs(240))
         .args(["--color", "never"]);
+    // Only a test that writes its own sources.toml scans remote mirrors.
+    if !home.join(".config/cass/sources.toml").exists() {
+        command.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    }
     command
 }
 
@@ -493,5 +496,90 @@ fn gh536_a_new_device_number_after_a_remount_does_not_reparse_unchanged_sources(
             // reused one keeps the row the older build wrote.
             assert_eq!(legacy_rows, usize::from(reusable));
         }
+    }
+}
+
+/// Write one Pi session (header + one user message) under `project`.
+fn pi_session(project: &Path, id: &str, marker: &str) {
+    fs::create_dir_all(project).unwrap();
+    fs::write(
+        project.join(format!("2026-08-01T10-00-00-000Z_{id}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session", "id":id, "timestamp":"2026-08-01T10:00:00.000Z",
+                "cwd":"/home/me/work"}),
+            json!({"type":"message", "timestamp":"2026-08-01T10:00:01.000Z",
+                "message":{"role":"user", "content":[{"type":"text", "text":marker}]}}),
+        ),
+    )
+    .unwrap();
+}
+
+/// Pi sessions synced from a remote source must be skipped by the source
+/// ledger when unchanged, like Claude and Codex transcripts. Any newly synced
+/// file changes the source's mirror fingerprint, so the whole mirror is
+/// re-scanned without a `since_ts` cutoff; the Pi adapter used to hide FAD's
+/// source boundaries, so every such run re-parsed and re-ingested every
+/// mirrored Pi session.
+#[test]
+fn remote_mirror_pi_sessions_are_reused_when_unchanged() {
+    let reusable = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    for streaming in ["0", "1"] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let config = home.join(".config/cass");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("sources.toml"),
+            "[[sources]]\nname = \"devbox\"\ntype = \"ssh\"\nhost = \"me@devbox.invalid\"\n\
+             paths = [\"~/.pi/agent/sessions\"]\n",
+        )
+        .unwrap();
+        // The layout `cass sources sync` leaves for that configured path.
+        let sessions = home
+            .join("data/remotes/devbox/mirror")
+            .join(coding_agent_search::sources::sync::path_to_safe_dirname(
+                "~/.pi/agent/sessions",
+            ))
+            .join("sessions");
+        let first = "ghledgerpiremote000z";
+        pi_session(
+            &sessions.join("--home-me-work--"),
+            "0b6e4c2a-1111-2222-3333-444455556666",
+            first,
+        );
+        index(home, streaming, "initial", 0, 1);
+
+        // The next sync brings one new session from another project.
+        let second = "ghledgerpiremote001z";
+        pi_session(
+            &sessions.join("--home-me-other--"),
+            "0b6e4c2a-1111-2222-3333-777788889999",
+            second,
+        );
+        index(
+            home,
+            streaming,
+            "one-new",
+            usize::from(reusable),
+            1 + usize::from(!reusable),
+        );
+
+        let output = cass(home, streaming)
+            .args(["sessions", "--source", "devbox", "--json", "--limit", "0"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let listed: Value = serde_json::from_slice(&output).unwrap();
+        let listed = listed["sessions"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(
+            listed.iter().all(|row| row["agent"] == "pi_agent"),
+            "{listed:?}"
+        );
+        assert_searchable(home, first);
+        assert_searchable(home, second);
     }
 }
