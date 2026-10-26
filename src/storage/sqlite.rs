@@ -27026,6 +27026,116 @@ mod tests {
         );
     }
 
+    /// Rows indexed while the data dir was reached through a symlinked alias
+    /// (the old path kept as a compatibility link after the data dir moved)
+    /// still belong to the containers of the resolved data dir, and rows for
+    /// one file pair across the two spellings.
+    #[cfg(unix)]
+    #[test]
+    fn collapse_misattributed_mirror_rows_matches_rows_under_a_data_dir_alias() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("data");
+        let alias = dir.path().join("old-data-dir");
+        let container_rel = "remotes/laptop/mirror/.pi_agent_sessions_0123456789abcdef";
+        let container = real.join(container_rel);
+        fs::create_dir_all(container.join("sessions/--proj--")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("agent_search.db")).unwrap();
+        let seed = |slug: &str, path: &Path, external_id: &str| -> i64 {
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: slug.into(),
+                    name: slug.into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: slug.into(),
+                workspace: None,
+                external_id: Some(external_id.into()),
+                title: Some(external_id.into()),
+                source_path: path.to_path_buf(),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: external_id.into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "laptop".into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap()
+                .conversation_id
+        };
+        let session = |name: &str| {
+            let rel = format!("sessions/--proj--/{name}.jsonl");
+            fs::write(container.join(&rel), b"{}\n").unwrap();
+            rel
+        };
+        // Both rows under the alias spelling (how the old data dir recorded them).
+        let a = session("a");
+        let pi_a = seed("pi_agent", &alias.join(container_rel).join(&a), "a");
+        let claude_a = seed("claude_code", &alias.join(container_rel).join(&a), &a);
+        // The owner under the resolved spelling, the duplicate under the alias.
+        let b = session("b");
+        let pi_b = seed("pi_agent", &container.join(&b), "b");
+        let claude_b = seed("claude_code", &alias.join(container_rel).join(&b), &b);
+
+        let containers = [MirrorContainerOwners {
+            source_id: "laptop".into(),
+            container: container.clone(),
+            owner_agents: vec!["pi_agent".into(), "pi_durable".into()],
+        }];
+        let dry = storage
+            .collapse_misattributed_mirror_rows(&containers, true)
+            .unwrap();
+        let reported: Vec<(i64, Option<i64>)> = dry
+            .rows
+            .iter()
+            .map(|row| (row.conversation_id, row.owner_conversation_id))
+            .collect();
+        assert_eq!(reported, [(claude_a, Some(pi_a)), (claude_b, Some(pi_b))]);
+        assert_eq!(dry.conversations_affected, 2);
+        assert_eq!(dry.unmatched, 0);
+        assert!(
+            dry.rows[0]
+                .source_path
+                .starts_with(&*alias.to_string_lossy()),
+            "rows report the path they were archived under"
+        );
+
+        let applied = storage
+            .collapse_misattributed_mirror_rows(&containers, false)
+            .unwrap();
+        assert_eq!(applied.conversations_affected, 2);
+        let remaining: Vec<i64> = storage
+            .conn
+            .query_map_collect(
+                "SELECT id FROM conversations ORDER BY id",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let mut expected = vec![pi_a, pi_b];
+        expected.sort_unstable();
+        assert_eq!(remaining, expected);
+    }
+
     /// bgn6s: the cap bounds each message, never the conversation. A cumulative
     /// cap (the old behavior) cleared every message after the first 100 bytes.
     #[test]
