@@ -32795,6 +32795,21 @@ fn remote_mirror_scan_fingerprint(root_path: &Path) -> Option<String> {
     ))
 }
 
+/// The meta key a mirror root's scan-skip fingerprint is stored under.
+///
+/// A source syncing several configured paths has one mirror root per path,
+/// each fingerprinted over its own container, so the key must name the root.
+/// Keyed by the source alone, every root overwrote the same entry and only the
+/// root recorded last could ever match, so the other roots of a multi-path
+/// source were fully re-scanned on every run.
+fn remote_mirror_fingerprint_key(root: &ScanRoot) -> String {
+    let root_id = root
+        .mirrored_source_path
+        .clone()
+        .unwrap_or_else(|| root.path.to_string_lossy().into_owned());
+    format!("{}\u{1f}{root_id}", root.origin.source_id)
+}
+
 /// #372: has this mirror source already produced at least one canonical
 /// conversation row? Guards the skip so a never-indexed mirror is always
 /// scanned even if a stale fingerprint somehow matched.
@@ -32837,9 +32852,10 @@ fn plan_remote_mirror_scan_skips(
             scanned.push(root);
             continue;
         }
+        let fingerprint_key = remote_mirror_fingerprint_key(&root);
         let fingerprint_now = remote_mirror_scan_fingerprint(&root.path);
         let stored = storage
-            .read_mirror_scan_fingerprint(&root.origin.source_id)
+            .read_mirror_scan_fingerprint(&fingerprint_key)
             .ok()
             .flatten();
         let unchanged = skip_enabled
@@ -32858,7 +32874,7 @@ fn plan_remote_mirror_scan_skips(
             continue;
         }
         if let Some(fingerprint) = fingerprint_now {
-            fingerprints_to_store.push((root.origin.source_id.clone(), fingerprint));
+            fingerprints_to_store.push((fingerprint_key, fingerprint));
         }
         scanned.push(root);
     }
@@ -33079,7 +33095,8 @@ mod mirror_scan_skip_tests {
             "nothing skipped without a stored fingerprint"
         );
         assert_eq!(fps.len(), 1, "one remote fingerprint captured for storing");
-        assert_eq!(fps[0].0, "css");
+        assert_eq!(fps[0].0, remote_mirror_fingerprint_key(&remote));
+        assert!(fps[0].0.starts_with("css\u{1f}"), "keyed per source root");
         storage
             .record_mirror_scan_fingerprint(&fps[0].0, &fps[0].1)
             .unwrap();
