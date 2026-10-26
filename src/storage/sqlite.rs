@@ -11416,27 +11416,45 @@ impl FrankenStorage {
                 fparams![container.source_id.as_str()],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )?;
-            let mut by_path: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
+            // Rows keep the absolute path the data dir had when they were
+            // indexed. A data dir reached through another spelling (a symlink
+            // left behind when the data dir moved, or `/var` vs
+            // `/private/var`) must still match its containers, and two rows
+            // for one file must still pair, so compare resolved paths.
+            let resolve =
+                |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let resolved_container = resolve(&container.container);
+            let mut by_path: HashMap<PathBuf, Vec<(i64, &str, &str)>> = HashMap::new();
             for (id, agent, source_path) in &source_rows {
-                if Path::new(source_path).starts_with(&container.container) {
-                    by_path
-                        .entry(source_path.as_str())
-                        .or_default()
-                        .push((*id, agent.as_str()));
-                }
+                let path = Path::new(source_path);
+                let key = if path.starts_with(&container.container) {
+                    resolve(path)
+                } else {
+                    let resolved = resolve(path);
+                    if !resolved.starts_with(&resolved_container) {
+                        continue;
+                    }
+                    resolved
+                };
+                by_path
+                    .entry(key)
+                    .or_default()
+                    .push((*id, agent.as_str(), source_path.as_str()));
             }
             let owns = |agent: &str| container.owner_agents.iter().any(|owner| owner == agent);
-            for (source_path, rows) in by_path {
+            for rows in by_path.into_values() {
                 let owner_conversation_id = rows
                     .iter()
-                    .filter(|(_, agent)| owns(agent))
-                    .map(|(id, _)| *id)
+                    .filter(|(_, agent, _)| owns(agent))
+                    .map(|(id, _, _)| *id)
                     .min();
-                for (conversation_id, agent) in rows.iter().filter(|(_, agent)| !owns(agent)) {
+                for (conversation_id, agent, source_path) in
+                    rows.iter().filter(|(_, agent, _)| !owns(agent))
+                {
                     result.rows.push(MisattributedMirrorRow {
                         conversation_id: *conversation_id,
                         source_id: container.source_id.clone(),
-                        source_path: source_path.to_string(),
+                        source_path: (*source_path).to_string(),
                         agent: (*agent).to_string(),
                         owner_agents: container.owner_agents.clone(),
                         owner_conversation_id,
