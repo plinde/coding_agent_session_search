@@ -445,27 +445,44 @@ fn source_file_has_active_advisory_lock(path: &Path) -> bool {
 mod linux_publish_swap {
     use std::ffi::{c_char, c_int, c_uint};
 
-    pub const AT_FDCWD: c_int = -100;
-    pub const RENAME_EXCHANGE: c_uint = 0x2;
-    /// Linux's `<errno.h>` definition (`EINVAL = 22`). We don't depend on
-    /// `libc` directly — `errno.h` has guaranteed this value on every
-    /// glibc/musl architecture since the kernel was renumbered, and
-    /// pulling in `libc` for one constant inflates compile time.
-    /// Cross-checked against `man 2 renameat2` (returns EINVAL when the
-    /// underlying filesystem doesn't support `RENAME_EXCHANGE`).
-    pub const EINVAL: i32 = 22;
+    pub const AT_FDCWD: c_int = libc::AT_FDCWD;
+    pub const RENAME_EXCHANGE: c_uint = libc::RENAME_EXCHANGE;
+    /// `renameat2` returns EINVAL when the filesystem does not support
+    /// `RENAME_EXCHANGE` (`man 2 renameat2`).
+    pub const EINVAL: i32 = libc::EINVAL;
+    /// A kernel older than 3.15 has no `renameat2` syscall at all.
+    pub const ENOSYS: i32 = libc::ENOSYS;
 
-    // SAFETY: a raw libc symbol declaration; the only caller is
-    // `atomic_exchange_paths`, which documents its argument invariants.
+    /// Issue the `renameat2` syscall directly. glibc only gained a
+    /// `renameat2()` wrapper in 2.28, so linking against that symbol left the
+    /// binary unbuildable on hosts with an older glibc (Ubuntu 18.04 ships
+    /// 2.27) even though their kernels have had the syscall since 3.15.
+    ///
+    /// # Safety
+    /// `oldpath` and `newpath` must be valid NUL-terminated C strings that
+    /// outlive the call.
     #[allow(unsafe_code)]
-    unsafe extern "C" {
-        pub fn renameat2(
-            olddirfd: c_int,
-            oldpath: *const c_char,
-            newdirfd: c_int,
-            newpath: *const c_char,
-            flags: c_uint,
-        ) -> c_int;
+    pub unsafe fn renameat2(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+        flags: c_uint,
+    ) -> c_int {
+        // SAFETY: forwarded from the caller's contract; the remaining
+        // arguments are plain integers.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            )
+        };
+        // The syscall returns 0 or -1 (with errno set), which fits c_int.
+        result as c_int
     }
 }
 
@@ -25474,7 +25491,9 @@ pub(crate) fn linux_atomic_exchange_is_unsupported(error: &anyhow::Error) -> boo
         cause
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)
-            == Some(linux_publish_swap::EINVAL)
+            .is_some_and(|code| {
+                code == linux_publish_swap::EINVAL || code == linux_publish_swap::ENOSYS
+            })
     })
 }
 
@@ -69093,6 +69112,48 @@ c.close()
             Some("user@laptop.local".to_string())
         );
         assert_eq!(remote_root.platform, Some(Platform::Linux));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_exchange_paths_swaps_directories_through_the_raw_syscall() {
+        let tmp = TempDir::new().unwrap();
+        let left = tmp.path().join("staged");
+        let right = tmp.path().join("live");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("generation"), b"new").unwrap();
+        std::fs::write(right.join("generation"), b"old").unwrap();
+
+        atomic_exchange_paths(&left, &right).expect("RENAME_EXCHANGE on a local filesystem");
+        assert_eq!(std::fs::read(right.join("generation")).unwrap(), b"new");
+        assert_eq!(std::fs::read(left.join("generation")).unwrap(), b"old");
+
+        let missing = tmp.path().join("missing");
+        let err = atomic_exchange_paths(&missing, &right).expect_err("ENOENT");
+        assert!(
+            !linux_atomic_exchange_is_unsupported(&err),
+            "a missing path is a real error, not a fall-through: {err:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_atomic_exchange_falls_through_on_einval_and_enosys() {
+        for (code, unsupported) in [
+            (linux_publish_swap::EINVAL, true),
+            (linux_publish_swap::ENOSYS, true),
+            (libc::ENOENT, false),
+            (libc::EXDEV, false),
+        ] {
+            let err = anyhow::Error::new(std::io::Error::from_raw_os_error(code))
+                .context("atomically exchanging lexical publish paths");
+            assert_eq!(
+                linux_atomic_exchange_is_unsupported(&err),
+                unsupported,
+                "errno {code}"
+            );
+        }
     }
 
     #[test]
