@@ -32994,6 +32994,67 @@ mod mirror_scan_skip_tests {
     }
 
     #[test]
+    fn plan_skips_each_unchanged_root_of_a_multi_path_source() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let opts = base_opts(&db_path, tmp.path());
+
+        // One source syncing several configured paths has one mirror root
+        // (container) per path, scanned and fingerprinted separately.
+        let mirror = tmp.path().join("remotes/css/mirror");
+        let containers = [
+            ("~/.claude/projects", ".claude_projects_0123456789abcdef"),
+            (
+                "~/.cache/cass-export/opencode",
+                ".cache_cass-export_opencode_0123456789abcdef",
+            ),
+            (
+                "~/.pi/agent/sessions",
+                ".pi_agent_sessions_0123456789abcdef",
+            ),
+        ];
+        let roots: Vec<ScanRoot> = containers
+            .iter()
+            .map(|(configured, container)| {
+                let path = mirror.join(container);
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("session.data"), configured.as_bytes()).unwrap();
+                ssh_root(&path, "css").with_mirrored_source_path(*configured)
+            })
+            .collect();
+
+        let (scanned, fps) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert_eq!(scanned.len(), 3);
+        assert_eq!(fps.len(), 3, "each root captures its own fingerprint");
+        for (key, fingerprint) in &fps {
+            storage
+                .record_mirror_scan_fingerprint(key, fingerprint)
+                .unwrap();
+        }
+        insert_conv_with_source(&storage, "css", &roots[0].path.join("session.data"));
+
+        // Nothing changed: no root may be re-scanned, not only the last one
+        // whose fingerprint happened to be stored.
+        let (scanned, fps) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert!(
+            scanned.is_empty(),
+            "unchanged roots re-scanned: {:?}",
+            scanned.iter().map(|root| &root.path).collect::<Vec<_>>()
+        );
+        assert!(fps.is_empty());
+
+        // A new file in one container re-scans only that root.
+        std::fs::write(roots[0].path.join("new.data"), b"new").unwrap();
+        let (scanned, fps) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert_eq!(
+            scanned.iter().map(|root| &root.path).collect::<Vec<_>>(),
+            [&roots[0].path]
+        );
+        assert_eq!(fps.len(), 1);
+    }
+
+    #[test]
     fn plan_skips_only_unchanged_indexed_remote_mirrors() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
