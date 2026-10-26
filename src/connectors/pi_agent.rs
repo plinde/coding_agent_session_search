@@ -4,7 +4,11 @@
 //! OMP identity boundary when a broad copied-home or remote-mirror root makes
 //! Pi's permissive explicit-root detection walk into an OMP store.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use anyhow::Result;
+use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext,
@@ -67,31 +71,80 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut conversations = Vec::new();
+        self.scan_with_source_boundaries(
+            ctx,
+            &mut SourceScanHooks::default(),
+            &mut |conversation| {
+                conversations.push(conversation);
+                Ok(())
+            },
+        )?;
+        Ok(conversations)
+    }
+
+    // FAD's Pi reader reports per-source boundaries; forward them so the
+    // indexer's source ledger can skip unchanged sessions. Without this the
+    // indexer fell back to a plain scan, and since remote mirror roots are
+    // always scanned without a `since_ts` cutoff, every `cass index` re-parsed
+    // and re-ingested every Pi session synced from every remote source.
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
         let ownership = super::omp::PiFamilyOwnership::live();
-        let mut conversations = self.inner.scan(ctx)?;
+        let hooks = RefCell::new(hooks);
+        // FAD's roots and the direct-root fallback can reach the same file.
+        // Each source is offered to the host at most once, so the fallback
+        // never re-admits a source the host already declined as unchanged.
+        let considered = RefCell::new(HashSet::new());
+        let mut should_scan = |source: &DiscoveredSourceFile| {
+            let key = std::fs::canonicalize(&source.source_path)
+                .unwrap_or_else(|_| source.source_path.clone());
+            considered.borrow_mut().insert(key)
+                && ownership.owner(&source.source_path) != super::omp::PiFamilyOwner::Omp
+                && hooks.borrow_mut().should_scan(source)
+        };
+        let mut complete = |completion: &SourceCompletion| hooks.borrow_mut().complete(completion);
+        let mut boundaries = SourceScanHooks {
+            should_scan_source: Some(&mut should_scan),
+            on_source_complete: Some(&mut complete),
+        };
+        let mut deliver = |mut conversation: NormalizedConversation| {
+            if ownership.owner(&conversation.source_path) == super::omp::PiFamilyOwner::Omp {
+                return Ok(());
+            }
+            super::omp::promote_transcript_session_ids(std::slice::from_mut(&mut conversation));
+            on_conversation(conversation)
+        };
+
+        self.inner
+            .scan_with_source_boundaries(ctx, &mut boundaries, &mut deliver)?;
 
         if !ctx.use_default_detection() {
             let direct_roots = ctx
                 .scan_roots
                 .iter()
                 .filter(|root| ownership.owner(&root.path) == super::omp::PiFamilyOwner::PiAgent)
-                .map(|root| root.path.clone())
+                .map(|root| (root.clone(), None))
                 .collect::<Vec<_>>();
             if !direct_roots.is_empty() {
-                let fallback = franken_agent_detection::connectors::pi_wire::scan_homes(
+                franken_agent_detection::connectors::pi_wire::scan_roots_with_boundaries(
                     &direct_roots,
                     ctx,
                     "pi_agent",
+                    &mut boundaries,
+                    &mut deliver,
                 )?;
-                super::omp::append_missing_conversations(&mut conversations, fallback);
             }
         }
-
-        conversations.retain(|conversation| {
-            ownership.owner(&conversation.source_path) != super::omp::PiFamilyOwner::Omp
-        });
-        super::omp::promote_transcript_session_ids(&mut conversations);
-        Ok(conversations)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
